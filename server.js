@@ -1,9 +1,9 @@
-require("dotenv").config(); // Carrega variáveis de ambiente
+require("dotenv").config();
 const express = require("express");
-const AWS = require("aws-sdk");
 const cors = require("cors");
-const crypto = require('crypto');
-const { exec } = require('child_process');
+const crypto = require("crypto");
+const { exec } = require("child_process");
+const { LightsailClient, GetInstancesCommand, GetDomainsCommand, GetInstanceMetricDataCommand } = require("@aws-sdk/client-lightsail");
 
 const app = express();
 const PORT = 3000;
@@ -12,103 +12,159 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Configurar cliente Lightsail
-AWS.config.update({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION,
+// Configuração do cliente Lightsail
+const lightsailClient = new LightsailClient({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
 });
 
-const lightsail = new AWS.Lightsail();
+// Lista de métricas a coletar
+const METRICS = [
+    { name: "CPUUtilization", unit: "Percent", period: 300 },
+    { name: "NetworkIn", unit: "Bytes", period: 300 },
+    { name: "NetworkOut", unit: "Bytes", period: 300 },
+    { name: "StatusCheckFailed", unit: "Count", period: 60 },
+    { name: "StatusCheckFailed_Instance", unit: "Count", period: 60 },
+    { name: "StatusCheckFailed_System", unit: "Count", period: 60 },
+    { name: "BurstCapacityTime", unit: "Seconds", period: 300 },
+    { name: "BurstCapacityPercentage", unit: "Percent", period: 300 },
+    { name: "MetadataNoToken", unit: "Count", period: 300 },
+];
 
+// Função auxiliar para realizar tentativas com repetição
+async function fetchWithRetry(fetchFunction, retries = 3, delay = 1000) {
+    let lastError;
+    for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+            return await fetchFunction();
+        } catch (error) {
+            lastError = error;
+            console.error(`Erro na tentativa ${attempt + 1}:`, error.message);
+            await new Promise((resolve) => setTimeout(resolve, delay)); // Aguarda antes da próxima tentativa
+        }
+    }
+    throw lastError; // Lança o último erro após todas as tentativas falharem
+}
+
+// Rota para obter instâncias
 app.get("/instances", async (req, res) => {
-  try {
-    // Obter instâncias
-    const response = await lightsail.getInstances().promise();
+    try {
+        const instancesResponse = await lightsailClient.send(new GetInstancesCommand({}));
+        const instances = instancesResponse.instances || [];
+        const domainsResponse = await lightsailClient.send(new GetDomainsCommand({}));
+        const domains = domainsResponse.domains || [];
 
-    // Obter domínios associados
-    const domainResponse = await lightsail.getDomains().promise();
-    const domains = domainResponse.domains;
+        const detailedInstances = await Promise.all(
+            instances.map(async (instance) => {
+                const startTime = new Date(Date.now() - 5 * 60 * 1000);
+                const endTime = new Date();
 
-    const instances = await Promise.all(
-      response.instances.map(async (instance) => {
-        // Buscar métricas da instância (CPU, rede, etc.)
-        const [cpuUsage] = await Promise.all([
-          lightsail.getInstanceMetricData({
-            instanceName: instance.name,
-            metricName: "CPUUtilization",
-            period: 60,
-            startTime: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
-            endTime: new Date().toISOString(),
-            statistics: ["Average"],
-            unit: "Percent",
-          }).promise(),
-        ]);
+                const metricsData = await Promise.all(
+                    METRICS.map(async (metric) => {
+                        try {
+                            return await fetchWithRetry(async () => {
+                                const metricDataResponse = await lightsailClient.send(new GetInstanceMetricDataCommand({
+                                    instanceName: instance.name,
+                                    metricName: metric.name,
+                                    period: metric.period,
+                                    startTime,
+                                    endTime,
+                                    statistics: ["Average"],
+                                    unit: metric.unit,
+                                }));
+                                let averageValue = metricDataResponse.metricData?.[0]?.average || "Sem dados";
 
-        // Encontrar domínio associado
-        const associatedDomain = domains
-          .flatMap((domain) => domain.domainEntries)
-          .find((entry) => entry.target === instance.publicIpAddress);
+                                // Converte "." para "," se for um número
+                                if (typeof averageValue === "number") {
+                                    averageValue = averageValue.toLocaleString("pt-BR", {
+                                        minimumFractionDigits: 2,
+                                        maximumFractionDigits: 2,
+                                    });
+                                }
 
-        return {
-          name: instance.name,
-          state: instance.state.name,
-          blueprint: instance.blueprintId,
-          bundle: instance.bundleId,
-          region: instance.location.regionName,
-          publicIp: instance.publicIpAddress || "No IP assigned",
-          dns: associatedDomain ? associatedDomain.name : "No domain assigned",
-          metrics: {
-            cpu: cpuUsage.metricData.length ? cpuUsage.metricData[0].average : "No data",
-          },
-        };
-      })
-    );
+                                return { [metric.name]: averageValue };
+                            });
+                        } catch (error) {
+                            console.error(`Erro ao buscar métrica ${metric.name} para instância ${instance.name}:`, error);
+                            return { [metric.name]: "Erro ao buscar dados" };
+                        }
+                    })
+                );
 
-    res.json({ status: "success", data: instances });
-  } catch (error) {
-    console.error("Erro ao buscar instâncias ou domínios:", error);
-    res.status(500).json({ status: "error", message: error.message });
-  }
+                const metricsSummary = metricsData.reduce((acc, curr) => ({ ...acc, ...curr }), {});
+
+                const diskDetails = instance.hardware.disks.map((disk) => ({
+                    name: disk.name,
+                    sizeInGb: disk.sizeInGb,
+                    isSystemDisk: disk.isSystemDisk,
+                    state: disk.state,
+                    path: disk.path,
+                    gbInUse: disk.gbInUse || "Sem dados",
+                }));
+
+                const associatedDomain = domains
+                    .flatMap((domain) => domain.domainEntries || [])
+                    .find((entry) => entry.target === instance.publicIpAddress);
+
+                return {
+                    name: instance.name,
+                    state: instance.state?.name,
+                    blueprint: instance.blueprintId,
+                    bundle: instance.bundleId,
+                    region: instance.location?.regionName,
+                    publicIp: instance.publicIpAddress || "Sem IP atribuído",
+                    dns: associatedDomain?.name || "Sem domínio atribuído",
+                    metrics: metricsSummary,
+                    disks: diskDetails,
+                };
+            })
+        );
+
+        res.json({ status: "success", data: detailedInstances });
+    } catch (error) {
+        console.error("Erro ao buscar instâncias ou domínios:", error);
+        res.status(500).json({ status: "error", message: "Erro ao buscar instâncias ou domínios." });
+    }
 });
-
-
 
 
 // Webhook para atualizar o servidor
-app.post('/webhook', express.json(), (req, res) => {
-  const secret = 'minha-chave-secreta'; // Substitua pela chave configurada no GitHub
-  const payload = JSON.stringify(req.body);
+app.post("/webhook", express.json(), (req, res) => {
+    const secret = "minha-chave-secreta";
+    const payload = JSON.stringify(req.body);
 
-  if (!req.headers['x-hub-signature-256']) {
-    console.error('Signature missing.');
-    return res.status(403).send('Signature missing.');
-  }
+    if (!req.headers["x-hub-signature-256"]) {
+        console.error("Assinatura requirida");
+        return res.status(403).send("Assinatura requirida.");
+    }
 
-  const signature = `sha256=${crypto.createHmac('sha256', secret).update(payload).digest('hex')}`;
+    const signature = `sha256=${crypto.createHmac("sha256", secret).update(payload).digest("hex")}`;
 
-  if (req.headers['x-hub-signature-256'] !== signature) {
-    console.error('Invalid signature.');
-    return res.status(403).send('Invalid signature.');
-  }
+    if (req.headers["x-hub-signature-256"] !== signature) {
+        console.error("Assinatura inválida.");
+        return res.status(403).send("Assinatura inválida.");
+    }
 
-  console.log('Webhook recebido:', req.body);
+    console.log("Webhook recebido:", req.body);
 
-  if (req.body.ref === 'refs/heads/main') { // Verifica se é um push na branch "main"
-    exec('cd /opt/bitnami/projects/instancias && git pull && pm2 restart instancias', (err, stdout, stderr) => {
-      if (err) {
-        console.error(`Erro ao atualizar o servidor: ${stderr}`);
-        return res.status(500).send('Erro ao atualizar o servidor.');
-      }
-      console.log(`Servidor atualizado: ${stdout}`);
-      res.status(200).send('Servidor atualizado.');
-    });
-  } else {
-    res.status(200).send('Nenhuma ação necessária.');
-  }
+    if (req.body.ref === "refs/heads/main") {
+        exec("cd /opt/bitnami/projects/instancias && git pull && pm2 restart instancias", (err, stdout, stderr) => {
+            if (err) {
+                console.error(`Erro ao atualizar o servidor: ${stderr}`);
+                return res.status(500).send("Erro ao atualizar o servidor.");
+            }
+            console.log(`Servidor atualizado: ${stdout}`);
+            res.status(200).send("Servidor atualizado.");
+        });
+    } else {
+        res.status(200).send("Nenhuma ação necessária.");
+    }
 });
 
 // Inicia o servidor
 app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
+    console.log(`Servidor rodando em http://localhost:${PORT}`);
 });
