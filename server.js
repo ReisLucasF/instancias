@@ -52,9 +52,9 @@ async function fetchWithRetry(fetchFunction, retries = 3, delay = 1000) {
 // Mapeamento customizado
 const customMappings = {
     nexcrm: { name: "Nex CRM", dns: "nexcrm.sistemasdevos.com.br" },
-    HSM2: { name: "HSM2" },
+    HSM2: { dns: "hsm2.sistemasdevos.com.br",name: "HSM2" },
     cabralnovo: { dns: "vincitcrm.com.br", name: "Vincit" },
-    joycebrun: { dns: "metodojb.sistemasdevos.com.br", name: "Vincit" },
+    joycebrun: { dns: "metodojb.sistemasdevos.com.br", name: "Metodo JB" },
     HST: { dns: "hst2.sistemasdevos.com.br", name: "HST Contingência" },
     espelho1: { dns: "hst.sistemasdevos.com.br", name: "HST" },
     SEDURB: { dns: "sedurbjp.sistemasdevos.com.br", name: "Smart Urban" },
