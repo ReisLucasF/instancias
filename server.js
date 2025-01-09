@@ -49,6 +49,18 @@ async function fetchWithRetry(fetchFunction, retries = 3, delay = 1000) {
     throw lastError; // Lança o último erro após todas as tentativas falharem
 }
 
+// Mapeamento customizado
+const customMappings = {
+    nexcrm: { name: "Nex CRM", dns: "nexcrm.sistemasdevos.com.br" },
+    HSM2: { name: "HSM2" },
+    cabralnovo: { dns: "vincitcrm.com.br", name: "Vincit" },
+    joycebrun: { dns: "metodojb.sistemasdevos.com.br", name: "Vincit" },
+    HST: { dns: "hst2.sistemasdevos.com.br", name: "HST Contingência" },
+    espelho1: { dns: "hst.sistemasdevos.com.br", name: "HST" },
+    SEDURB: { dns: "sedurbjp.sistemasdevos.com.br", name: "Smart Urban" },
+    suporte: { dns: "suporte.sistemasdevos.com.br", name: "Suporte Devos" },
+};
+
 // Rota para obter instâncias
 app.get("/instances", async (req, res) => {
     try {
@@ -109,14 +121,19 @@ app.get("/instances", async (req, res) => {
                     .flatMap((domain) => domain.domainEntries || [])
                     .find((entry) => entry.target === instance.publicIpAddress);
 
+                // Aplicação do mapeamento customizado
+                const customMapping = customMappings[instance.name] || {};
+                const name = customMapping.name || instance.name;
+                const dns = customMapping.dns || associatedDomain?.name || "Sem domínio atribuído";
+
                 return {
-                    name: instance.name,
+                    name,
                     state: instance.state?.name,
                     blueprint: instance.blueprintId,
                     bundle: instance.bundleId,
                     region: instance.location?.regionName,
                     publicIp: instance.publicIpAddress || "Sem IP atribuído",
-                    dns: associatedDomain?.name || "Sem domínio atribuído",
+                    dns,
                     metrics: metricsSummary,
                     disks: diskDetails,
                 };
